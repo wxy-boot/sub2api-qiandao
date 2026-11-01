@@ -51,6 +51,8 @@ const config = {
   checkinTimezone: process.env.CHECKIN_TIMEZONE || "Asia/Shanghai",
   checkinNotePrefix: process.env.CHECKIN_NOTE_PREFIX || "Daily check-in",
   checkinAdminPassword: process.env.CHECKIN_ADMIN_PASSWORD || "",
+  // 机器人接口（AstrBot 插件等）共享密钥；为空时接口返回 bot_disabled。
+  botSharedSecret: process.env.BOT_SHARED_SECRET || "",
   dbFile: path.resolve(rootDir, process.env.CHECKIN_DB_FILE || process.env.SQLITE_FILE || "./data/checkins.db"),
   legacyDataFile: path.resolve(rootDir, process.env.DATA_FILE || "./data/checkins.json"),
   publicTokenStorageKeys: splitCsv(
@@ -115,6 +117,12 @@ server.listen(config.port, () => {
   if (!config.adminApiKey && !config.adminAuthValue) {
     logWarn("config.missing_admin_api_key", {
       message: "SUB2API_ADMIN_API_KEY is empty; check-in will fail."
+    });
+  }
+
+  if (!config.botSharedSecret) {
+    logWarn("config.missing_bot_shared_secret", {
+      message: "BOT_SHARED_SECRET is empty; bot APIs return bot_disabled."
     });
   }
 
@@ -214,6 +222,11 @@ async function route(req, res) {
       rewardSummary,
       system: getAdminSystemInfo()
     });
+    return;
+  }
+
+  if (routePath === "/api/bot/checkin" || routePath === "/api/bot/status") {
+    await handleBotRequest(req, res, routePath, method, url);
     return;
   }
 
@@ -373,6 +386,148 @@ async function checkIn(user) {
   });
 }
 
+async function handleBotRequest(req, res, routePath, method, url) {
+  requireBot(req);
+
+  if (routePath === "/api/bot/checkin") {
+    if (method !== "POST") {
+      throw httpError(405, "method_not_allowed", "机器人签到接口只接受 POST 请求。");
+    }
+
+    const body = await readJsonBody(req);
+    const user = resolveBotUser(body?.userId, body?.userName);
+    let result;
+
+    try {
+      result = await checkIn(user);
+    } catch (error) {
+      throw normalizeBotError(error, user);
+    }
+
+    logInfo("bot.checkin", {
+      source: "bot",
+      userId: user.id,
+      date: result.date,
+      alreadyCheckedIn: Boolean(result.alreadyCheckedIn),
+      amount: result.entry?.amount ?? null,
+      unit: config.checkinUnit
+    });
+
+    sendJson(res, 200, toBotCheckinPayload(result));
+    return;
+  }
+
+  if (method !== "GET") {
+    throw httpError(405, "method_not_allowed", "机器人状态接口只接受 GET 请求。");
+  }
+
+  const user = resolveBotUser(url.searchParams.get("userId"), url.searchParams.get("userName"));
+  const date = dateKey(new Date(), config.checkinTimezone);
+  const entry = findEntry(user.id, date);
+  const eligibility = await resolveCheckinEligibility(user, date, { strict: false });
+
+  logInfo("bot.status", {
+    source: "bot",
+    userId: user.id,
+    date,
+    checkedIn: Boolean(entry)
+  });
+
+  sendJson(res, 200, {
+    ok: true,
+    date,
+    unit: config.checkinUnit,
+    checkedIn: Boolean(entry),
+    entry: entry ? publicEntry(entry) : null,
+    eligibility
+  });
+}
+
+function requireBot(req) {
+  if (!config.botSharedSecret) {
+    throw httpError(403, "bot_disabled", "机器人接口未启用，请先在服务端配置 BOT_SHARED_SECRET。");
+  }
+
+  const provided = String(req.headers["x-bot-secret"] || "").trim();
+
+  if (!provided || !safeEqual(provided, config.botSharedSecret)) {
+    throw httpError(401, "invalid_bot_secret", "机器人密钥错误。");
+  }
+}
+
+function resolveBotUser(userId, userName) {
+  const id = String(userId ?? "").trim();
+
+  if (!id) {
+    throw httpError(400, "invalid_user_id", "缺少 userId。");
+  }
+
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.:@-]{0,127}$/.test(id)) {
+    throw httpError(400, "invalid_user_id", "userId 格式不合法。");
+  }
+
+  return {
+    id,
+    name: cleanDisplayName(userName),
+    email: "",
+    balance: null
+  };
+}
+
+function cleanDisplayName(value) {
+  return String(value ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
+function toBotCheckinPayload(result) {
+  const { user: _ignored, ...payload } = result;
+
+  return {
+    ...payload,
+    unit: config.checkinUnit
+  };
+}
+
+const BOT_ERROR_CODES = new Set([
+  "invalid_user_id",
+  "invalid_bot_secret",
+  "bot_disabled",
+  "daily_spend_not_enough",
+  "user_not_found",
+  "compliance_required",
+  "upstream_error",
+  "upstream_timeout",
+  "internal_error",
+  "method_not_allowed"
+]);
+
+// 机器人接口只暴露文档约定的错误码：其余上游错误统一收敛为 502/504。
+function normalizeBotError(error, user) {
+  if (error?.status && BOT_ERROR_CODES.has(error.code)) {
+    return error;
+  }
+
+  const status = Number(error?.status) || 500;
+  const eligibility = error?.details?.eligibility;
+  const details = eligibility ? { eligibility } : {};
+
+  logError("bot.upstream_error", {
+    source: "bot",
+    userId: user?.id ? String(user.id) : "",
+    status,
+    code: error?.code || "",
+    message: error?.message || ""
+  });
+
+  if (status === 504) {
+    return httpError(504, "upstream_timeout", "Sub2API 响应超时，请稍后再试。", details);
+  }
+
+  return httpError(502, "upstream_error", "上游服务异常，请稍后再试。", details);
+}
+
 async function resolveCurrentUser(req) {
   const headers = buildUserAuthHeaders(req);
   const tokenUser = extractUserFromJwt(req);
@@ -468,6 +623,15 @@ async function addUserBalance(userId, amount, note) {
       status: upstream.status,
       body: upstream.body
     });
+
+    if (upstream.status === 404) {
+      throw httpError(404, "user_not_found", "Sub2API 用户不存在。");
+    }
+
+    if (upstream.status === 423) {
+      throw httpError(423, "compliance_required", "站点管理员尚未完成合规确认。");
+    }
+
     throw httpError(502, "balance_update_failed", "Sub2API 余额增加失败。");
   }
 

@@ -465,9 +465,117 @@ SUB2API_DAILY_SPEND_AMOUNT_FIELD=data.total_cost
 
 如果不配置金额字段，服务会尝试自动识别 `total_cost`、`totalAmount`、`cost`、`usage`、`amount` 等常见字段；如果接口返回记录数组，也会尝试汇总每条记录的金额字段。
 
+## 机器人接口（QQ 机器人 / AstrBot 插件）
+
+服务内置一套给机器人调用的内部接口，不经过 Sub2API 用户登录，只认共享密钥。配套插件：[astrbot_plugin_sub2api_qqbot](https://github.com/wxy-boot/astrbot-plugin-qqbot)。
+
+配置：
+
+```dotenv
+# 与 sub2api-choujiang 使用同一个值
+BOT_SHARED_SECRET=用 openssl rand -hex 32 生成
+```
+
+- 为空时接口返回 `403 bot_disabled`，浏览器侧签到不受影响。
+- 密钥通过 `X-Bot-Secret` 头传递，服务端使用常量时间比较。
+- 这两个接口**只监听内网/容器网络**；如需暴露公网，必须在反向代理再加一层限制。
+
+### 签到
+
+```http
+POST {PUBLIC_BASE_PATH}/api/bot/checkin
+Content-Type: application/json
+X-Bot-Secret: <secret>
+
+{"userId":"42","userName":"alice"}
+```
+
+成功（含重复签到）：
+
+```json
+{
+  "ok": true,
+  "date": "2026-11-01",
+  "unit": "USD",
+  "alreadyCheckedIn": false,
+  "entry": {
+    "date": "2026-11-01",
+    "amount": 0.3,
+    "unit": "USD",
+    "rewardLabel": "连续签到奖励",
+    "note": "Daily check-in 2026-11-01 0.3 USD",
+    "createdAt": "2026-11-01T00:12:00.000Z"
+  },
+  "eligibility": {
+    "enabled": true,
+    "requiredAmount": 10,
+    "currentAmount": 12.34,
+    "remainingAmount": 0,
+    "unit": "USD",
+    "timezone": "Asia/Shanghai",
+    "eligible": true
+  }
+}
+```
+
+已签到时会返回 `alreadyCheckedIn: true` 和当天记录，不会重复发放。
+
+### 状态
+
+```http
+GET {PUBLIC_BASE_PATH}/api/bot/status?userId=42
+X-Bot-Secret: <secret>
+```
+
+```json
+{
+  "ok": true,
+  "date": "2026-11-01",
+  "unit": "USD",
+  "checkedIn": true,
+  "entry": { "...": "同上" },
+  "eligibility": { "...": "同上" }
+}
+```
+
+### 错误码
+
+| HTTP | `error` | 说明 |
+| --- | --- | --- |
+| 400 | `invalid_user_id` | `userId` 缺失或格式不合法 |
+| 401 | `invalid_bot_secret` | 密钥错误 |
+| 403 | `bot_disabled` | 未配置 `BOT_SHARED_SECRET` |
+| 403 | `daily_spend_not_enough` | 已开启门槛且当天消费不足（带 `eligibility`） |
+| 404 | `user_not_found` | Sub2API 用户不存在 |
+| 405 | `method_not_allowed` | 请求方法不对 |
+| 423 | `compliance_required` | Sub2API 要求管理员先完成合规确认 |
+| 502 | `upstream_error` | Sub2API 返回异常 |
+| 504 | `upstream_timeout` | Sub2API 超时 |
+
+错误响应统一为 `{"ok": false, "error": "...", "message": "..."}`，能带 `eligibility` 的会一并带上，方便机器人显示具体差额。
+
+> 门槛只由本服务自己的设置决定（后台的 `daily_spend_enabled` / `daily_spend_required_amount`），机器人接口不接受门槛参数，也无法绕过。
+
+自测：
+
+```bash
+curl -s -X POST http://127.0.0.1:8787/checkin/api/bot/checkin \
+  -H "X-Bot-Secret: $BOT_SHARED_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"42","userName":"alice"}'
+```
+
 ## 生产注意事项
 
 - SQLite 适合单实例部署。如果要多副本、多服务器共享写入，应改成 PostgreSQL、MySQL 或 Redis 原子去重。
 - 如果反代时去掉了 `/checkin` 前缀，把 `PUBLIC_BASE_PATH=/`。
 - 如果用户接口不是 `/api/v1/auth/me`，修改 `SUB2API_AUTH_ME_PATH`。
 - 如果前端无法自动识别 token，可把实际 localStorage key 加到 `PUBLIC_TOKEN_STORAGE_KEYS`。
+- `BOT_SHARED_SECRET` 只放在服务端，不要写进前端或提交到仓库；轮换时记得同步更新机器人与抽奖服务。
+
+## 测试
+
+```bash
+npm test        # node:test，会临时启动服务与模拟 Sub2API
+npm run check   # 语法检查
+```

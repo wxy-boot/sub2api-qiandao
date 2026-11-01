@@ -5,6 +5,9 @@ services:
     restart: unless-stopped
     env_file:
       - .env
+    environment:
+      # QQ 机器人（AstrBot 插件）共享密钥；写在 .env 里即可，compose 会一并读取。
+      BOT_SHARED_SECRET: ${BOT_SHARED_SECRET:-}
     ports:
       - "8787:8787"
     volumes:
