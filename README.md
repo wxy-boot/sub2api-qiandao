@@ -66,14 +66,15 @@ SUB2API_DAILY_SPEND_AMOUNT_FIELD=data.stats.{id}.today_actual_cost
 npm run start:env
 ```
 
-Docker Compose：
+Docker Compose（默认使用 GHCR 上的远程镜像）：
 
 ```bash
+cp .env.example .env && mkdir -p data
 docker compose pull
 docker compose up -d
 ```
 
-默认 `docker-compose.yml` 使用 GitHub Packages 发布的镜像，不需要本机构建，因此不会拉取 `node:24-alpine` 基础镜像。
+`docker-compose.yml` 里的镜像地址是 `ghcr.io/wxy-boot/sub2api-qiandao:latest`，包为公开状态，**不需要 `docker login`**，服务器上也不需要 Node.js。
 
 如果需要本地构建镜像：
 
@@ -90,7 +91,7 @@ docker run -d \
   --env-file .env \
   -p 8787:8787 \
   -v "$(pwd)/data:/app/data" \
-  ghcr.io/jiangdengke/sub2api-qiandao:latest
+  ghcr.io/wxy-boot/sub2api-qiandao:latest
 ```
 
 ## 生产部署
@@ -137,10 +138,49 @@ extra_hosts:
 
 ### 2. 启动服务
 
+两种方式二选一，`docker-compose.yml` 默认使用远程镜像。
+
+#### 方式 A：使用远程镜像（推荐）
+
+服务器上**不需要 Node.js、不需要 git**，只要 Docker：
+
 ```bash
+# 1. 只取这两个文件
+wget https://raw.githubusercontent.com/wxy-boot/sub2api-qiandao/master/docker-compose.yml
+wget https://raw.githubusercontent.com/wxy-boot/sub2api-qiandao/master/.env.example -O .env
+mkdir -p data
+
+# 2. 编辑 .env（见上一步）
+
+# 3. 拉镜像并启动
 docker compose pull
 docker compose up -d
 docker logs -f sub2api-qiandao
+```
+
+镜像地址（已写在 `docker-compose.yml` 里）：
+
+```text
+ghcr.io/wxy-boot/sub2api-qiandao:latest            最新构建
+ghcr.io/wxy-boot/sub2api-qiandao:sha-<7位提交号>   固定到某个提交
+ghcr.io/wxy-boot/sub2api-qiandao:<标签名>          固定到某个 tag
+```
+
+- 该包是**公开**的，`docker pull` 不需要登录 GitHub。
+- 想固定版本、避免 `latest` 漂移，把 compose 里的 `:latest` 换成 `:sha-db6543d` 这类 sha 标签。
+- 如果以后把包改成 Private，服务器需要先登录一次：
+  ```bash
+  echo "你的-PAT" | docker login ghcr.io -u wxy-boot --password-stdin
+  ```
+  PAT 需要勾选 `read:packages`。
+- 国内服务器拉取 ghcr.io 慢或失败，可以给 Docker 配置镜像加速，或改用方式 B 本地构建。
+
+#### 方式 B：本地构建
+
+已经有源码目录、或想自己改代码时用：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
 健康检查：
@@ -228,24 +268,42 @@ https://你的-sub2api-域名/checkin/?theme=dark&lang=zh&ui_mode=embedded
 
 ### 5. 更新镜像
 
-每次 GitHub Actions 发布新镜像后，服务器执行：
+每次 GitHub Actions 发布新镜像后，服务器执行（远程镜像）：
 
 ```bash
+git pull                # 若改了 compose/.env 模板才需要
 docker compose pull
 docker compose up -d
-docker logs -f sub2api-qiandao
+docker logs --tail 50 sub2api-qiandao
 ```
 
-数据库在 `./data/checkins.db`，只要继续挂载 `./data:/app/data`，更新容器不会丢数据。
+本地构建则用：
+
+```bash
+git pull
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
+```
+
+数据库在 `./data/checkins.db`，只要继续挂载 `./data:/app/data`，更新容器不会丢数据；后台设置的门槛和奖励规则也不会被覆盖（只有空键才会写入默认值）。
 
 ## 镜像发布
 
 推送到 `master` 分支或推送 `v*` tag 时，GitHub Actions 会构建并发布多架构镜像到 GitHub Container Registry：
 
 ```text
-ghcr.io/jiangdengke/sub2api-qiandao:latest
-ghcr.io/jiangdengke/sub2api-qiandao:<tag>
-ghcr.io/jiangdengke/sub2api-qiandao:sha-<commit>
+ghcr.io/wxy-boot/sub2api-qiandao:latest
+ghcr.io/wxy-boot/sub2api-qiandao:master
+ghcr.io/wxy-boot/sub2api-qiandao:<tag>
+ghcr.io/wxy-boot/sub2api-qiandao:sha-<commit>
+```
+
+`docker-compose.yml` 里的 `image` 已经是这个地址，`docker compose pull` 即可拉到最新构建。
+
+核对容器里的版本：
+
+```bash
+docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' \
+  ghcr.io/wxy-boot/sub2api-qiandao:latest
 ```
 
 ## 日志
