@@ -1,0 +1,685 @@
+const state = {
+  password: sessionStorage.getItem("checkinAdminPassword") || "",
+  config: null,
+  activeTab: sessionStorage.getItem("checkinAdminTab") || "overview",
+  recentEntries: []
+};
+
+const elements = {
+  loginPanel: document.querySelector("#loginPanel"),
+  adminTabs: document.querySelector("#adminTabs"),
+  tabButtons: [...document.querySelectorAll(".tab-button")],
+  tabPanels: [...document.querySelectorAll(".tab-page")],
+  overviewPanel: document.querySelector("#overviewPanel"),
+  statsPanel: document.querySelector("#statsPanel"),
+  configPanel: document.querySelector("#configPanel"),
+  historyPanel: document.querySelector("#historyPanel"),
+  systemPanel: document.querySelector("#systemPanel"),
+  passwordInput: document.querySelector("#passwordInput"),
+  loginButton: document.querySelector("#loginButton"),
+  unitText: document.querySelector("#unitText"),
+  timezoneText: document.querySelector("#timezoneText"),
+  modeText: document.querySelector("#modeText"),
+  rewardModeInputs: [...document.querySelectorAll("input[name='rewardMode']")],
+  rangeSection: document.querySelector("#rangeSection"),
+  weightedSection: document.querySelector("#weightedSection"),
+  rangeMinInput: document.querySelector("#rangeMinInput"),
+  rangeMaxInput: document.querySelector("#rangeMaxInput"),
+  rangeStepInput: document.querySelector("#rangeStepInput"),
+  rangePreview: document.querySelector("#rangePreview"),
+  dailySpendEnabledInput: document.querySelector("#dailySpendEnabledInput"),
+  dailySpendRequiredInput: document.querySelector("#dailySpendRequiredInput"),
+  dailySpendPreview: document.querySelector("#dailySpendPreview"),
+  notePrefixInput: document.querySelector("#notePrefixInput"),
+  rules: document.querySelector("#rules"),
+  rulesForm: document.querySelector("#rulesForm"),
+  addRuleButton: document.querySelector("#addRuleButton"),
+  reloadButton: document.querySelector("#reloadButton"),
+  message: document.querySelector("#message"),
+  statsDateText: document.querySelector("#statsDateText"),
+  todayCountText: document.querySelector("#todayCountText"),
+  todayAmountText: document.querySelector("#todayAmountText"),
+  monthUsersText: document.querySelector("#monthUsersText"),
+  monthAmountText: document.querySelector("#monthAmountText"),
+  allTimeCountText: document.querySelector("#allTimeCountText"),
+  allTimeAmountText: document.querySelector("#allTimeAmountText"),
+  allTimeUsersText: document.querySelector("#allTimeUsersText"),
+  averageRewardText: document.querySelector("#averageRewardText"),
+  trendList: document.querySelector("#trendList"),
+  rewardBreakdownList: document.querySelector("#rewardBreakdownList"),
+  streakList: document.querySelector("#streakList"),
+  recordSearchInput: document.querySelector("#recordSearchInput"),
+  clearSearchButton: document.querySelector("#clearSearchButton"),
+  exportCsvButton: document.querySelector("#exportCsvButton"),
+  historyMetaText: document.querySelector("#historyMetaText"),
+  systemGrid: document.querySelector("#systemGrid"),
+  checklist: document.querySelector("#checklist"),
+  history: document.querySelector("#history")
+};
+
+boot();
+
+function boot() {
+  elements.passwordInput.value = state.password;
+  elements.loginButton.addEventListener("click", () => void login());
+  elements.passwordInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      void login();
+    }
+  });
+  for (const input of elements.rewardModeInputs) {
+    input.addEventListener("change", updateRewardModeUi);
+  }
+  for (const input of [elements.rangeMinInput, elements.rangeMaxInput, elements.rangeStepInput]) {
+    input.addEventListener("input", renderRangePreview);
+  }
+  elements.dailySpendEnabledInput.addEventListener("change", renderDailySpendPreview);
+  elements.dailySpendRequiredInput.addEventListener("input", renderDailySpendPreview);
+  for (const button of elements.tabButtons) {
+    button.addEventListener("click", () => activateTab(button.dataset.tab));
+  }
+  elements.recordSearchInput.addEventListener("input", () => renderHistory());
+  elements.clearSearchButton.addEventListener("click", () => {
+    elements.recordSearchInput.value = "";
+    renderHistory();
+  });
+  elements.exportCsvButton.addEventListener("click", exportHistoryCsv);
+  elements.addRuleButton.addEventListener("click", () => {
+    addRuleRow({
+      id: `rule-${Date.now()}`,
+      label: "随机奖励",
+      amount: 0.1,
+      weight: 10,
+      enabled: true
+    });
+    updateProbabilities();
+  });
+  elements.reloadButton.addEventListener("click", () => void loadConfig());
+  elements.rulesForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    void saveConfig();
+  });
+
+  if (state.password) {
+    void loadConfig();
+  }
+}
+
+async function login() {
+  state.password = elements.passwordInput.value.trim();
+  sessionStorage.setItem("checkinAdminPassword", state.password);
+  await loadConfig();
+}
+
+async function loadConfig() {
+  try {
+    const data = await adminFetch("/api/admin/config");
+    state.config = data;
+    renderConfig(data);
+    showMessage("配置已加载。", "success");
+  } catch (error) {
+    showMessage(error.message, "error");
+  }
+}
+
+async function saveConfig() {
+  try {
+    const rewardMode = readRewardMode();
+    const rewardRange = readRewardRange();
+    const rewardRules = readRules();
+    const dailySpendRequirement = readDailySpendRequirement();
+    const data = await adminFetch("/api/admin/config", {
+      method: "PUT",
+      body: {
+        notePrefix: elements.notePrefixInput.value.trim(),
+        dailySpendRequirement,
+        rewardMode,
+        rewardRange,
+        rewardRules
+      }
+    });
+    state.config = {
+      ...state.config,
+      notePrefix: data.notePrefix,
+      rewardMode: data.rewardMode,
+      rewardRange: data.rewardRange,
+      rewardRules: data.rewardRules,
+      dailySpendRequirement: data.dailySpendRequirement,
+      rewardSummary: data.rewardSummary
+    };
+    renderRules(data.rewardRules);
+    renderSummary(state.config);
+    showMessage("签到规则已保存，新签到会立即使用。", "success");
+  } catch (error) {
+    showMessage(error.message, "error");
+  }
+}
+
+async function adminFetch(path, options = {}) {
+  const basePath = window.__CHECKIN_BASE_PATH__ === "/" ? "" : window.__CHECKIN_BASE_PATH__;
+  const response = await fetch(`${basePath}${path}`, {
+    method: options.method || "GET",
+    headers: {
+      Accept: "application/json",
+      "Content-Type": "application/json",
+      "X-Checkin-Admin-Password": state.password
+    },
+    body: options.body ? JSON.stringify(options.body) : undefined
+  });
+  const payload = await response.json().catch(() => ({}));
+
+  if (!response.ok || payload.ok === false) {
+    throw new Error(payload.message || "请求失败");
+  }
+
+  return payload;
+}
+
+function renderConfig(data) {
+  elements.loginPanel.hidden = true;
+  elements.adminTabs.hidden = false;
+  state.recentEntries = data.recentEntries || [];
+  renderStats(data.stats);
+  renderSummary(data);
+  renderRules(data.rewardRules);
+  renderHistory();
+  renderSystem(data.system);
+  activateTab(state.activeTab);
+}
+
+function renderSummary(data) {
+  elements.unitText.textContent = data.unit;
+  elements.timezoneText.textContent = data.timezone;
+  elements.modeText.textContent = modeLabel(data.rewardMode, data.rewardSummary);
+  elements.notePrefixInput.value = data.notePrefix || "";
+  setRewardMode(data.rewardMode || data.rewardSummary?.sourceMode || "range_random");
+  const range = data.rewardRange || {
+    min: data.rewardSummary?.min || 0.1,
+    max: data.rewardSummary?.max || data.rewardSummary?.min || 0.1,
+    step: data.rewardSummary?.step || 0.01
+  };
+  elements.rangeMinInput.value = range.min;
+  elements.rangeMaxInput.value = range.max;
+  elements.rangeStepInput.value = range.step;
+  const dailySpendRequirement = data.dailySpendRequirement || data.system?.dailySpendRequirement || {
+    enabled: false,
+    requiredAmount: 0
+  };
+  elements.dailySpendEnabledInput.checked = Boolean(dailySpendRequirement.enabled);
+  elements.dailySpendRequiredInput.value = dailySpendRequirement.requiredAmount ?? 0;
+  updateRewardModeUi();
+  renderRangePreview();
+  renderDailySpendPreview();
+}
+
+function renderRules(rules) {
+  elements.rules.textContent = "";
+
+  for (const rule of rules) {
+    addRuleRow(rule);
+  }
+
+  updateProbabilities();
+}
+
+function addRuleRow(rule) {
+  const row = document.createElement("article");
+  row.className = "rule-row";
+  row.innerHTML = `
+    <label>
+      <span>启用</span>
+      <input class="rule-enabled" type="checkbox" ${rule.enabled ? "checked" : ""} />
+    </label>
+    <label>
+      <span>名称</span>
+      <input class="rule-label" type="text" value="${escapeAttr(rule.label)}" placeholder="小奖" />
+    </label>
+    <label>
+      <span>金额</span>
+      <input class="rule-amount" type="number" min="0" step="0.000001" value="${rule.amount}" />
+    </label>
+    <label>
+      <span>权重</span>
+      <input class="rule-weight" type="number" min="0" step="0.000001" value="${rule.weight}" />
+    </label>
+    <div class="probability">
+      <span>概率</span>
+      <strong class="rule-probability">-</strong>
+    </div>
+    <button class="remove-rule" type="button">删除</button>
+  `;
+  row.dataset.ruleId = rule.id;
+  row.querySelector(".remove-rule").addEventListener("click", () => {
+    row.remove();
+    updateProbabilities();
+  });
+
+  for (const input of row.querySelectorAll("input")) {
+    input.addEventListener("input", updateProbabilities);
+    input.addEventListener("change", updateProbabilities);
+  }
+
+  elements.rules.append(row);
+}
+
+function readRules() {
+  return [...elements.rules.querySelectorAll(".rule-row")].map((row, index) => ({
+    id: row.dataset.ruleId || `rule-${index + 1}`,
+    label: row.querySelector(".rule-label").value.trim() || `档位 ${index + 1}`,
+    amount: Number(row.querySelector(".rule-amount").value),
+    weight: Number(row.querySelector(".rule-weight").value),
+    enabled: row.querySelector(".rule-enabled").checked
+  }));
+}
+
+function readRewardMode() {
+  return elements.rewardModeInputs.find((input) => input.checked)?.value || "range_random";
+}
+
+function setRewardMode(mode) {
+  const normalized = mode === "weighted_random" ? "weighted_random" : "range_random";
+
+  for (const input of elements.rewardModeInputs) {
+    input.checked = input.value === normalized;
+  }
+}
+
+function readRewardRange() {
+  return {
+    min: Number(elements.rangeMinInput.value),
+    max: Number(elements.rangeMaxInput.value),
+    step: Number(elements.rangeStepInput.value)
+  };
+}
+
+function readDailySpendRequirement() {
+  return {
+    enabled: elements.dailySpendEnabledInput.checked,
+    requiredAmount: Number(elements.dailySpendRequiredInput.value)
+  };
+}
+
+function updateRewardModeUi() {
+  const mode = readRewardMode();
+  elements.rangeSection.hidden = mode !== "range_random";
+  elements.weightedSection.hidden = mode !== "weighted_random";
+  document.body.dataset.rewardMode = mode;
+}
+
+function renderRangePreview() {
+  const range = readRewardRange();
+  const unit = state.config?.unit || "";
+
+  if (!Number.isFinite(range.min) || !Number.isFinite(range.max) || !Number.isFinite(range.step)) {
+    elements.rangePreview.textContent = "请输入完整的最小金额、最大金额和步长。";
+    return;
+  }
+
+  if (range.min <= 0 || range.max <= 0 || range.step <= 0 || range.max < range.min) {
+    elements.rangePreview.textContent = "金额和步长必须大于 0，且最大金额不能小于最小金额。";
+    return;
+  }
+
+  const stepsFloat = (range.max - range.min) / range.step;
+  const steps = Math.round(stepsFloat);
+
+  if (Math.abs(stepsFloat - steps) > 1e-8) {
+    elements.rangePreview.textContent = "最大金额减最小金额需要能被步长整除。";
+    return;
+  }
+
+  const count = steps + 1;
+
+  elements.rangePreview.textContent = `会从 ${formatAmount(range.min)} 到 ${formatAmount(range.max)} ${unit} 中等概率抽取，步长 ${formatAmount(range.step)}，共 ${count} 个可能值。`;
+}
+
+function renderDailySpendPreview() {
+  const requirement = readDailySpendRequirement();
+  const unit = state.config?.unit || "";
+
+  if (!requirement.enabled) {
+    elements.dailySpendPreview.textContent = "未启用时，用户无需消费即可签到。";
+    return;
+  }
+
+  if (!Number.isFinite(requirement.requiredAmount) || requirement.requiredAmount <= 0) {
+    elements.dailySpendPreview.textContent = "启用消费门槛时，金额必须大于 0。";
+    return;
+  }
+
+  elements.dailySpendPreview.textContent = `用户当天消费达到 ${formatAmount(requirement.requiredAmount)} ${unit} 后才可以签到。`;
+}
+
+function updateProbabilities() {
+  const rows = [...elements.rules.querySelectorAll(".rule-row")];
+  const weights = rows.map((row) => {
+    if (!row.querySelector(".rule-enabled").checked) {
+      return 0;
+    }
+
+    return Number(row.querySelector(".rule-weight").value) || 0;
+  });
+  const total = weights.reduce((sum, weight) => sum + weight, 0);
+
+  rows.forEach((row, index) => {
+    const probability = total > 0 ? weights[index] / total : 0;
+    row.querySelector(".rule-probability").textContent = `${Math.round(probability * 1000) / 10}%`;
+  });
+}
+
+function modeLabel(mode, summary) {
+  if (mode === "weighted_random") {
+    return summary?.mode === "fixed" ? "固定档位" : "权重随机";
+  }
+
+  return summary?.mode === "fixed" ? "固定金额" : "区间随机";
+}
+
+function formatAmount(value) {
+  return Number(value).toLocaleString("en-US", {
+    maximumFractionDigits: 6
+  });
+}
+
+function renderStats(stats) {
+  if (!stats) {
+    return;
+  }
+
+  elements.statsDateText.textContent = `${stats.today} · ${stats.month}`;
+  elements.todayCountText.textContent = `${stats.todayCount || 0} 人`;
+  elements.todayAmountText.textContent = `${formatAmount(stats.todayAmount || 0)} ${stats.unit}`;
+  elements.monthUsersText.textContent = `${stats.monthUsers || 0} 人`;
+  elements.monthAmountText.textContent = `${formatAmount(stats.monthAmount || 0)} ${stats.unit}`;
+  elements.allTimeCountText.textContent = `${stats.allTimeCount || 0} 次`;
+  elements.allTimeAmountText.textContent = `${formatAmount(stats.allTimeAmount || 0)} ${stats.unit}`;
+  elements.allTimeUsersText.textContent = `${stats.allTimeUsers || 0} 人`;
+  elements.averageRewardText.textContent = `${formatAmount(stats.averageReward || 0)} ${stats.unit}`;
+  renderTrend(stats.dailyTrend || [], stats.unit);
+  renderRewardBreakdown(stats.rewardBreakdown || [], stats.unit);
+  renderStreaks(stats.longestStreaks || []);
+}
+
+function renderTrend(trend, unit) {
+  elements.trendList.textContent = "";
+
+  if (trend.length === 0) {
+    elements.trendList.innerHTML = `<p class="empty">还没有趋势数据。</p>`;
+    return;
+  }
+
+  const maxAmount = Math.max(...trend.map((entry) => Number(entry.amount || 0)), 0);
+
+  for (const entry of trend) {
+    const amount = Number(entry.amount || 0);
+    const count = Number(entry.count || 0);
+    const width = maxAmount > 0 ? Math.max(6, Math.round((amount / maxAmount) * 100)) : 0;
+    const item = document.createElement("article");
+    item.className = "trend-item";
+    item.innerHTML = `
+      <span>${escapeHtml(entry.date.slice(5))}</span>
+      <div class="trend-track"><i style="width: ${width}%"></i></div>
+      <strong>${formatAmount(amount)} ${escapeHtml(unit)}</strong>
+      <small>${count} 次</small>
+    `;
+    elements.trendList.append(item);
+  }
+}
+
+function renderRewardBreakdown(items, unit) {
+  elements.rewardBreakdownList.textContent = "";
+
+  if (items.length === 0) {
+    elements.rewardBreakdownList.innerHTML = `<p class="empty">本月还没有奖励分布。</p>`;
+    return;
+  }
+
+  const maxCount = Math.max(...items.map((entry) => Number(entry.count || 0)), 0);
+
+  for (const entry of items) {
+    const count = Number(entry.count || 0);
+    const width = maxCount > 0 ? Math.max(8, Math.round((count / maxCount) * 100)) : 0;
+    const item = document.createElement("article");
+    item.className = "breakdown-item";
+    item.innerHTML = `
+      <div>
+        <strong>${escapeHtml(entry.label || "奖励")}</strong>
+        <span>${count} 次 · ${formatAmount(entry.totalAmount || 0)} ${escapeHtml(entry.unit || unit)}</span>
+      </div>
+      <div class="breakdown-track"><i style="width: ${width}%"></i></div>
+    `;
+    elements.rewardBreakdownList.append(item);
+  }
+}
+
+function renderStreaks(streaks) {
+  elements.streakList.textContent = "";
+
+  if (streaks.length === 0) {
+    elements.streakList.innerHTML = `<p class="empty">还没有连续签到记录。</p>`;
+    return;
+  }
+
+  for (const [index, entry] of streaks.entries()) {
+    const item = document.createElement("article");
+    item.className = "streak-item";
+    item.innerHTML = `
+      <span>${index + 1}</span>
+      <strong>${escapeHtml(entry.userDisplayName || entry.userName || entry.userEmail || `用户 ${entry.userId}`)}</strong>
+      <b>连续 ${entry.streak} 天</b>
+      <small>${escapeHtml(entry.lastDate || "")}</small>
+    `;
+    elements.streakList.append(item);
+  }
+}
+
+function renderHistory() {
+  const query = getRecordSearchQuery();
+  const entries = getFilteredEntries();
+
+  elements.history.textContent = "";
+  elements.historyMetaText.textContent = query
+    ? `筛选 ${entries.length} / ${state.recentEntries.length} 条`
+    : `最近 ${state.recentEntries.length} 条`;
+
+  if (entries.length === 0) {
+    elements.history.innerHTML = `<p class="empty">${query ? "没有匹配的签到记录。" : "还没有签到记录。"}</p>`;
+    return;
+  }
+
+  for (const entry of entries) {
+    const item = document.createElement("article");
+    item.className = "history-item";
+    const userName = entry.userDisplayName || entry.userName || entry.userEmail || `用户 ${entry.userId}`;
+    item.innerHTML = `
+      <div>
+        <strong>${escapeHtml(userName)}</strong>
+        <span>${escapeHtml(entry.date)} · ${escapeHtml(entry.rewardLabel || "奖励")} · 连续 ${entry.streak || 1} 天</span>
+      </div>
+      <b>${entry.amount} ${escapeHtml(entry.unit)}</b>
+    `;
+    elements.history.append(item);
+  }
+}
+
+function renderSystem(system) {
+  if (!system) {
+    return;
+  }
+
+  const dailySpendRequirement = system.dailySpendRequirement || { enabled: false };
+  const dailySpendText = dailySpendRequirement.enabled
+    ? `${formatAmount(dailySpendRequirement.requiredAmount)} ${dailySpendRequirement.unit}`
+    : "未启用";
+
+  const items = [
+    ["存储", system.storage],
+    ["SQLite 文件", system.dbFile],
+    ["公开路径", system.publicBasePath],
+    ["Sub2API 地址", system.sub2apiBaseUrl],
+    ["用户认证接口", system.authMePath],
+    ["余额接口模板", system.balancePathTemplate],
+    ["余额操作", system.balanceOperation],
+    ["金额字段", system.balanceAmountField],
+    ["Admin 鉴权头", system.adminAuthHeader],
+    ["消费门槛", dailySpendText],
+    ["消费查询方法", dailySpendRequirement.enabled ? system.dailySpendMethod : "-"],
+    ["消费鉴权头", dailySpendRequirement.enabled ? system.dailySpendAuthHeader : "-"],
+    ["消费接口模板", dailySpendRequirement.enabled ? system.dailySpendPathTemplate : "-"],
+    ["消费请求体模板", dailySpendRequirement.enabled ? system.dailySpendBodyTemplate || "-" : "-"],
+    ["消费金额字段", dailySpendRequirement.enabled ? system.dailySpendAmountField || "自动识别" : "-"],
+    ["时区", system.timezone],
+    ["奖励单位", system.unit]
+  ];
+
+  elements.systemGrid.textContent = "";
+  for (const [label, value] of items) {
+    const item = document.createElement("article");
+    item.className = "system-item";
+    item.innerHTML = `
+      <span>${escapeHtml(label)}</span>
+      <strong>${escapeHtml(value || "-")}</strong>
+    `;
+    elements.systemGrid.append(item);
+  }
+
+  const checks = [
+    {
+      ok: Boolean(system.adminAuthConfigured),
+      title: "Sub2API 管理员 API Key",
+      text: system.adminAuthConfigured ? "已配置，签到可以尝试发放余额。" : "未配置，用户签到会失败。"
+    },
+    {
+      ok: Boolean(system.sub2apiBaseUrl),
+      title: "Sub2API 地址",
+      text: system.sub2apiBaseUrl || "未配置"
+    },
+    {
+      ok: Boolean(system.publicBasePath),
+      title: "公开路径",
+      text: `当前服务路径为 ${system.publicBasePath || "/"}`
+    },
+    {
+      ok: !dailySpendRequirement.enabled || Boolean(system.dailySpendConfigured && system.dailySpendAuthConfigured),
+      title: "每日消费门槛",
+      text: dailySpendRequirement.enabled
+        ? system.dailySpendConfigured && system.dailySpendAuthConfigured
+          ? `已启用，达到 ${dailySpendText} 后可签到。`
+          : "已启用，但消费统计接口或鉴权未配置完整。"
+        : "未启用，用户无需消费即可签到。"
+    }
+  ];
+
+  elements.checklist.textContent = "";
+  for (const check of checks) {
+    const item = document.createElement("article");
+    item.className = `check-item ${check.ok ? "is-ok" : "is-warn"}`;
+    item.innerHTML = `
+      <span>${check.ok ? "OK" : "!"}</span>
+      <div>
+        <strong>${escapeHtml(check.title)}</strong>
+        <small>${escapeHtml(check.text)}</small>
+      </div>
+    `;
+    elements.checklist.append(item);
+  }
+}
+
+function activateTab(tabName = "overview") {
+  const available = new Set(elements.tabButtons.map((button) => button.dataset.tab));
+  const nextTab = available.has(tabName) ? tabName : "overview";
+  state.activeTab = nextTab;
+  sessionStorage.setItem("checkinAdminTab", nextTab);
+
+  for (const button of elements.tabButtons) {
+    const active = button.dataset.tab === nextTab;
+    button.classList.toggle("is-active", active);
+    button.setAttribute("aria-selected", active ? "true" : "false");
+  }
+
+  for (const panel of elements.tabPanels) {
+    panel.hidden = panel.dataset.panel !== nextTab;
+  }
+}
+
+function exportHistoryCsv() {
+  const entries = getFilteredEntries();
+  const rows = [
+    ["用户ID", "用户", "日期", "金额", "单位", "奖励", "连续天数", "上游状态", "创建时间"],
+    ...entries.map((entry) => [
+      entry.userId,
+      entry.userDisplayName || entry.userName || entry.userEmail || `用户 ${entry.userId}`,
+      entry.date,
+      entry.amount,
+      entry.unit,
+      entry.rewardLabel || "",
+      entry.streak || 0,
+      entry.upstreamStatus || "",
+      entry.createdAt || ""
+    ])
+  ];
+  const csv = rows.map((row) => row.map(escapeCsv).join(",")).join("\n");
+  const blob = new Blob([`\ufeff${csv}`], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+
+  link.href = url;
+  link.download = `checkins-${new Date().toISOString().slice(0, 10)}.csv`;
+  link.click();
+  URL.revokeObjectURL(url);
+}
+
+function getFilteredEntries() {
+  const query = getRecordSearchQuery();
+
+  return state.recentEntries.filter((entry) => {
+    if (!query) {
+      return true;
+    }
+
+    return [
+      entry.userDisplayName,
+      entry.userName,
+      entry.userEmail,
+      entry.userId,
+      entry.date,
+      entry.rewardLabel,
+      entry.amount,
+      entry.unit
+    ]
+      .join(" ")
+      .toLowerCase()
+      .includes(query);
+  });
+}
+
+function getRecordSearchQuery() {
+  return elements.recordSearchInput.value.trim().toLowerCase();
+}
+
+function showMessage(text, tone) {
+  elements.message.textContent = text;
+  elements.message.dataset.tone = tone;
+}
+
+function escapeCsv(value) {
+  const text = String(value ?? "");
+
+  if (/[",\n\r]/.test(text)) {
+    return `"${text.replaceAll('"', '""')}"`;
+  }
+
+  return text;
+}
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+function escapeAttr(value) {
+  return escapeHtml(value).replaceAll("'", "&#39;");
+}
