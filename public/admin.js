@@ -30,6 +30,10 @@ const elements = {
   dailySpendEnabledInput: document.querySelector("#dailySpendEnabledInput"),
   dailySpendRequiredInput: document.querySelector("#dailySpendRequiredInput"),
   dailySpendPreview: document.querySelector("#dailySpendPreview"),
+  trialCreditEnabledInput: document.querySelector("#trialCreditEnabledInput"),
+  trialCreditAmountInput: document.querySelector("#trialCreditAmountInput"),
+  trialCreditDaysInput: document.querySelector("#trialCreditDaysInput"),
+  trialCreditPreview: document.querySelector("#trialCreditPreview"),
   notePrefixInput: document.querySelector("#notePrefixInput"),
   rules: document.querySelector("#rules"),
   rulesForm: document.querySelector("#rulesForm"),
@@ -75,6 +79,9 @@ function boot() {
   }
   elements.dailySpendEnabledInput.addEventListener("change", renderDailySpendPreview);
   elements.dailySpendRequiredInput.addEventListener("input", renderDailySpendPreview);
+  elements.trialCreditEnabledInput.addEventListener("change", renderTrialCreditPreview);
+  elements.trialCreditAmountInput.addEventListener("input", renderTrialCreditPreview);
+  elements.trialCreditDaysInput.addEventListener("input", renderTrialCreditPreview);
   for (const button of elements.tabButtons) {
     button.addEventListener("click", () => activateTab(button.dataset.tab));
   }
@@ -128,11 +135,13 @@ async function saveConfig() {
     const rewardRange = readRewardRange();
     const rewardRules = readRules();
     const dailySpendRequirement = readDailySpendRequirement();
+    const trialCredit = readTrialCredit();
     const data = await adminFetch("/api/admin/config", {
       method: "PUT",
       body: {
         notePrefix: elements.notePrefixInput.value.trim(),
         dailySpendRequirement,
+        trialCredit,
         rewardMode,
         rewardRange,
         rewardRules
@@ -145,6 +154,8 @@ async function saveConfig() {
       rewardRange: data.rewardRange,
       rewardRules: data.rewardRules,
       dailySpendRequirement: data.dailySpendRequirement,
+      trialCredit: data.trialCredit,
+      trialClaimStats: data.trialClaimStats ?? state.config?.trialClaimStats,
       rewardSummary: data.rewardSummary
     };
     renderRules(data.rewardRules);
@@ -207,9 +218,18 @@ function renderSummary(data) {
   };
   elements.dailySpendEnabledInput.checked = Boolean(dailySpendRequirement.enabled);
   elements.dailySpendRequiredInput.value = dailySpendRequirement.requiredAmount ?? 0;
+  const trialCredit = data.trialCredit || data.system?.trialCredit || {
+    enabled: false,
+    amount: 1,
+    allowedDays: 3
+  };
+  elements.trialCreditEnabledInput.checked = Boolean(trialCredit.enabled);
+  elements.trialCreditAmountInput.value = trialCredit.amount ?? 1;
+  elements.trialCreditDaysInput.value = trialCredit.allowedDays ?? 3;
   updateRewardModeUi();
   renderRangePreview();
   renderDailySpendPreview();
+  renderTrialCreditPreview();
 }
 
 function renderRules(rules) {
@@ -299,6 +319,14 @@ function readDailySpendRequirement() {
   };
 }
 
+function readTrialCredit() {
+  return {
+    enabled: elements.trialCreditEnabledInput.checked,
+    amount: Number(elements.trialCreditAmountInput.value),
+    allowedDays: Number(elements.trialCreditDaysInput.value)
+  };
+}
+
 function updateRewardModeUi() {
   const mode = readRewardMode();
   elements.rangeSection.hidden = mode !== "range_random";
@@ -348,6 +376,30 @@ function renderDailySpendPreview() {
   }
 
   elements.dailySpendPreview.textContent = `用户当天消费达到 ${formatAmount(requirement.requiredAmount)} ${unit} 后才可以签到。`;
+}
+
+function renderTrialCreditPreview() {
+  const trialCredit = readTrialCredit();
+  const unit = state.config?.unit || "";
+
+  if (!trialCredit.enabled) {
+    elements.trialCreditPreview.textContent = "未启用时，机器人会回复“测试额度活动未开启”。";
+    return;
+  }
+
+  if (!Number.isFinite(trialCredit.amount) || trialCredit.amount <= 0) {
+    elements.trialCreditPreview.textContent = "启用测试额度时，金额必须大于 0。";
+    return;
+  }
+
+  if (!Number.isFinite(trialCredit.allowedDays) || trialCredit.allowedDays < 1) {
+    elements.trialCreditPreview.textContent = "注册天数限制必须是不小于 1 的整数。";
+    return;
+  }
+
+  elements.trialCreditPreview.textContent = `注册未满 ${Math.round(
+    trialCredit.allowedDays
+  )} 天的账号可以在 QQ 中发送 /领测试额度 领取 ${formatAmount(trialCredit.amount)} ${unit}，每个账号限一次。`;
 }
 
 function updateProbabilities() {
@@ -511,6 +563,14 @@ function renderSystem(system) {
   const dailySpendText = dailySpendRequirement.enabled
     ? `${formatAmount(dailySpendRequirement.requiredAmount)} ${dailySpendRequirement.unit}`
     : "未启用";
+  const trialCredit = system.trialCredit || state.config?.trialCredit || { enabled: false };
+  const trialCreditText = trialCredit.enabled
+    ? `${formatAmount(trialCredit.amount)} ${trialCredit.unit || system.unit || ""} / 注册 ${trialCredit.allowedDays} 天内`
+    : "未启用";
+  const trialClaimStats = state.config?.trialClaimStats;
+  const trialClaimText = trialClaimStats
+    ? `${trialClaimStats.count} 人，共 ${formatAmount(trialClaimStats.amount)} ${trialClaimStats.unit || ""}`
+    : "-";
 
   const items = [
     ["存储", system.storage],
@@ -528,6 +588,10 @@ function renderSystem(system) {
     ["消费接口模板", dailySpendRequirement.enabled ? system.dailySpendPathTemplate : "-"],
     ["消费请求体模板", dailySpendRequirement.enabled ? system.dailySpendBodyTemplate || "-" : "-"],
     ["消费金额字段", dailySpendRequirement.enabled ? system.dailySpendAmountField || "自动识别" : "-"],
+    ["测试额度", trialCreditText],
+    ["测试额度用户接口", system.userInfoPathTemplate || "-"],
+    ["注册时间字段", system.userCreatedAtField || "-"],
+    ["已领测试额度", trialClaimText],
     ["时区", system.timezone],
     ["奖励单位", system.unit]
   ];
@@ -567,6 +631,15 @@ function renderSystem(system) {
           ? `已启用，达到 ${dailySpendText} 后可签到。`
           : "已启用，但消费统计接口或鉴权未配置完整。"
         : "未启用，用户无需消费即可签到。"
+    },
+    {
+      ok: !trialCredit.enabled || Boolean(system.trialCreditConfigured && system.adminAuthConfigured),
+      title: "领测试额度",
+      text: trialCredit.enabled
+        ? system.trialCreditConfigured && system.adminAuthConfigured
+          ? `已启用，注册 ${trialCredit.allowedDays} 天内的账号可领 ${formatAmount(trialCredit.amount)} ${trialCredit.unit || ""}。`
+          : "已启用，但用户信息接口（注册时间）或管理员 API Key 未配置。"
+        : "未启用，机器人回复“测试额度活动未开启”。"
     }
   ];
 

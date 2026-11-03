@@ -403,6 +403,15 @@ Docker 部署时，只要继续挂载 `./data:/app/data`，数据库文件就会
 
 服务启动时会在 SQLite 为空的情况下自动迁移旧 JSON 里的签到记录和奖励规则。迁移完成后，新的写入只进入 SQLite。
 
+数据表：
+
+| 表 | 用途 |
+| --- | --- |
+| `settings` | 后台配置（奖励模式、门槛、测试额度开关/金额/天数等） |
+| `reward_rules` | 权重档位 |
+| `checkins` | 每日签到记录，`UNIQUE (user_id, date)` |
+| `trial_claims` | 测试额度领取记录，`UNIQUE (user_id)`，保证每账号只领一次 |
+
 ## 工作流程
 
 1. 用户打开 Sub2API 左侧的“每日签到”菜单。
@@ -523,6 +532,30 @@ SUB2API_DAILY_SPEND_AMOUNT_FIELD=data.total_cost
 
 如果不配置金额字段，服务会尝试自动识别 `total_cost`、`totalAmount`、`cost`、`usage`、`amount` 等常见字段；如果接口返回记录数组，也会尝试汇总每条记录的金额字段。
 
+## 测试额度（注册 3 天内可领一次）
+
+给 QQ 机器人用的「新人测试额度」：只有**注册未超过 N 天**的账号能领，每个账号限一次，金额固定。
+
+- 开关、金额、注册天数都在管理后台「奖励模式 → 测试额度」里设置，保存后立即生效；
+- 领取记录写入 SQLite 的 `trial_claims` 表（`user_id` 唯一），先占位再加余额，重复请求不会重复发钱；
+- 注册时间从 Sub2API 管理接口读取，默认 `GET /api/v1/admin/users/{id}`、字段 `created_at`；
+- 读不到注册时间时**拒绝领取**，避免绕过新用户限制。
+
+`CHECKIN_TRIAL_CREDIT_*` 只是首次启动写入 SQLite 的默认值：
+
+```dotenv
+CHECKIN_TRIAL_CREDIT_ENABLED=true
+CHECKIN_TRIAL_CREDIT_AMOUNT=1
+CHECKIN_TRIAL_CREDIT_DAYS=3
+
+# 读取注册时间用的管理接口与字段（默认值即可，实例字段不同时再改）
+SUB2API_USER_INFO_PATH_TEMPLATE=/api/v1/admin/users/{id}
+SUB2API_USER_CREATED_AT_FIELD=created_at
+SUB2API_USER_BALANCE_FIELD=balance
+```
+
+改用自定义字段时，`SUB2API_USER_CREATED_AT_FIELD` 支持 `data.user.created_at` 这种点分路径（会自动兼容带 `{code,data}` 包一层的响应）。
+
 ## 机器人接口（QQ 机器人 / AstrBot 插件）
 
 服务内置一套给机器人调用的内部接口，不经过 Sub2API 用户登录，只认共享密钥。配套插件：[astrbot_plugin_sub2api_qqbot](https://github.com/wxy-boot/astrbot-plugin-qqbot)。
@@ -596,6 +629,53 @@ X-Bot-Secret: <secret>
 }
 ```
 
+### 领测试额度
+
+只允许**注册未超过 N 天**的账号领取一次固定金额（默认 3 天、1 USD）。开关、金额、天数都在管理后台「奖励模式 → 测试额度」里改，改完立即生效，机器人接口不接受金额参数。
+
+```http
+POST {PUBLIC_BASE_PATH}/api/bot/trial-credit
+Content-Type: application/json
+X-Bot-Secret: <secret>
+
+{"userId":"42","userName":"alice"}
+```
+
+成功：
+
+```json
+{
+  "ok": true,
+  "alreadyClaimed": false,
+  "unit": "USD",
+  "entry": {
+    "date": "2026-11-01",
+    "amount": 1,
+    "unit": "USD",
+    "rewardLabel": "测试额度",
+    "registeredAt": "2026-10-31T02:00:00.000Z",
+    "createdAt": "2026-11-01T00:12:00.000Z"
+  },
+  "eligibility": {
+    "enabled": true,
+    "eligible": true,
+    "claimed": true,
+    "amount": 1,
+    "unit": "USD",
+    "allowedDays": 3,
+    "registeredAt": "2026-10-31T02:00:00.000Z",
+    "registeredDays": 0.9,
+    "reason": "",
+    "message": ""
+  },
+  "balance": 6.2
+}
+```
+
+- 已领过：`200` + `alreadyClaimed: true` + 首次领取记录，不会再发钱。
+- 注册时间从 Sub2API 管理接口读取，默认 `GET /api/v1/admin/users/{id}`，字段默认 `created_at`；可用 `SUB2API_USER_INFO_PATH_TEMPLATE` / `SUB2API_USER_CREATED_AT_FIELD` / `SUB2API_USER_BALANCE_FIELD` 覆盖。
+- 注册时间读不到时**不放行**（`502 registration_time_unavailable`），避免绕过新用户限制。
+
 ### 错误码
 
 | HTTP | `error` | 说明 |
@@ -604,20 +684,29 @@ X-Bot-Secret: <secret>
 | 401 | `invalid_bot_secret` | 密钥错误 |
 | 403 | `bot_disabled` | 未配置 `BOT_SHARED_SECRET` |
 | 403 | `daily_spend_not_enough` | 已开启门槛且当天消费不足（带 `eligibility`） |
+| 403 | `trial_credit_disabled` | 后台关闭了领测试额度 |
+| 403 | `trial_window_expired` | 账号注册超过允许天数（带 `eligibility.registeredDays`） |
 | 404 | `user_not_found` | Sub2API 用户不存在 |
 | 405 | `method_not_allowed` | 请求方法不对 |
 | 423 | `compliance_required` | Sub2API 要求管理员先完成合规确认 |
+| 502 | `registration_time_unavailable` | 拿不到注册时间（用户信息接口或字段未配置） |
 | 502 | `upstream_error` | Sub2API 返回异常 |
 | 504 | `upstream_timeout` | Sub2API 超时 |
 
 错误响应统一为 `{"ok": false, "error": "...", "message": "..."}`，能带 `eligibility` 的会一并带上，方便机器人显示具体差额。
 
 > 门槛只由本服务自己的设置决定（后台的 `daily_spend_enabled` / `daily_spend_required_amount`），机器人接口不接受门槛参数，也无法绕过。
+> 测试额度同理：后台关闭、金额、注册天数都只由本服务控制。
 
 自测：
 
 ```bash
 curl -s -X POST http://127.0.0.1:8787/checkin/api/bot/checkin \
+  -H "X-Bot-Secret: $BOT_SHARED_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{"userId":"42","userName":"alice"}'
+
+curl -s -X POST http://127.0.0.1:8787/checkin/api/bot/trial-credit \
   -H "X-Bot-Secret: $BOT_SHARED_SECRET" \
   -H "Content-Type: application/json" \
   -d '{"userId":"42","userName":"alice"}'

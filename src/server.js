@@ -53,6 +53,15 @@ const config = {
   checkinAdminPassword: process.env.CHECKIN_ADMIN_PASSWORD || "",
   // 机器人接口（AstrBot 插件等）共享密钥；为空时接口返回 bot_disabled。
   botSharedSecret: process.env.BOT_SHARED_SECRET || "",
+  // 测试额度（QQ 机器人「/领测试额度」）：只允许注册未超过 N 天的账号领取一次。
+  // 这三项只是首次启动的默认值，之后可在管理后台调整。
+  trialCreditEnabled: readBoolEnv("CHECKIN_TRIAL_CREDIT_ENABLED", true),
+  trialCreditAmount: readFloatEnv("CHECKIN_TRIAL_CREDIT_AMOUNT", 1),
+  trialCreditDays: readIntEnv("CHECKIN_TRIAL_CREDIT_DAYS", 3),
+  // 读取用户注册时间用的 Sub2API 管理接口（团队版为 /api/v1/admin/users/{id}）。
+  userInfoPathTemplate: process.env.SUB2API_USER_INFO_PATH_TEMPLATE || "/api/v1/admin/users/{id}",
+  userCreatedAtField: process.env.SUB2API_USER_CREATED_AT_FIELD || "created_at",
+  userBalanceField: process.env.SUB2API_USER_BALANCE_FIELD || "balance",
   dbFile: path.resolve(rootDir, process.env.CHECKIN_DB_FILE || process.env.SQLITE_FILE || "./data/checkins.db"),
   legacyDataFile: path.resolve(rootDir, process.env.DATA_FILE || "./data/checkins.json"),
   publicTokenStorageKeys: splitCsv(
@@ -178,6 +187,9 @@ async function route(req, res) {
       timezone: config.checkinTimezone,
       notePrefix: getNotePrefix(),
       dailySpendRequirement,
+      trialCredit: publicTrialCreditConfig(),
+      trialClaimStats: getTrialClaimStats(),
+      trialClaims: getRecentTrialClaims(20).map(publicAdminTrialClaim),
       rewardMode: rewardConfig.mode,
       rewardRange: rewardConfig.range,
       rewardRules: rewardConfig.rewardRules,
@@ -199,8 +211,9 @@ async function route(req, res) {
     const dailySpendRequirement = validateDailySpendRequirement(
       body?.dailySpendRequirement ?? getDailySpendRequirement()
     );
+    const trialCredit = validateTrialCreditConfig(body?.trialCredit ?? getTrialCreditConfig());
 
-    saveAdminConfig({ rewardMode, rewardRange, rewardRules, notePrefix, dailySpendRequirement });
+    saveAdminConfig({ rewardMode, rewardRange, rewardRules, notePrefix, dailySpendRequirement, trialCredit });
     const rewardSummary = summarizeRewardConfig({ mode: rewardMode, range: rewardRange, rewardRules });
 
     logInfo("admin.config.updated", {
@@ -209,13 +222,16 @@ async function route(req, res) {
       count: rewardRules.length,
       enabledCount: rewardRules.filter((rule) => rule.enabled).length,
       notePrefix,
-      dailySpendRequirement
+      dailySpendRequirement,
+      trialCredit
     });
 
     sendJson(res, 200, {
       ok: true,
       notePrefix,
       dailySpendRequirement: publicDailySpendRequirement(),
+      trialCredit: publicTrialCreditConfig(),
+      trialClaimStats: getTrialClaimStats(),
       rewardMode,
       rewardRange,
       rewardRules,
@@ -225,7 +241,11 @@ async function route(req, res) {
     return;
   }
 
-  if (routePath === "/api/bot/checkin" || routePath === "/api/bot/status") {
+  if (
+    routePath === "/api/bot/checkin" ||
+    routePath === "/api/bot/status" ||
+    routePath === "/api/bot/trial-credit"
+  ) {
     await handleBotRequest(req, res, routePath, method, url);
     return;
   }
@@ -417,6 +437,33 @@ async function handleBotRequest(req, res, routePath, method, url) {
     return;
   }
 
+  if (routePath === "/api/bot/trial-credit") {
+    if (method !== "POST") {
+      throw httpError(405, "method_not_allowed", "机器人测试额度接口只接受 POST 请求。");
+    }
+
+    const body = await readJsonBody(req);
+    const user = resolveBotUser(body?.userId, body?.userName);
+    let result;
+
+    try {
+      result = await claimTrialCredit(user);
+    } catch (error) {
+      throw normalizeBotError(error, user);
+    }
+
+    logInfo("bot.trial_credit", {
+      source: "bot",
+      userId: user.id,
+      alreadyClaimed: Boolean(result.alreadyClaimed),
+      amount: result.entry?.amount ?? null,
+      unit: config.checkinUnit
+    });
+
+    sendJson(res, 200, toBotTrialCreditPayload(result));
+    return;
+  }
+
   if (method !== "GET") {
     throw httpError(405, "method_not_allowed", "机器人状态接口只接受 GET 请求。");
   }
@@ -490,11 +537,25 @@ function toBotCheckinPayload(result) {
   };
 }
 
+function toBotTrialCreditPayload(result) {
+  return {
+    ok: true,
+    alreadyClaimed: Boolean(result.alreadyClaimed),
+    unit: config.checkinUnit,
+    entry: result.entry || null,
+    eligibility: result.eligibility || null,
+    balance: Number.isFinite(result.balance) ? result.balance : null
+  };
+}
+
 const BOT_ERROR_CODES = new Set([
   "invalid_user_id",
   "invalid_bot_secret",
   "bot_disabled",
   "daily_spend_not_enough",
+  "trial_credit_disabled",
+  "trial_window_expired",
+  "registration_time_unavailable",
   "user_not_found",
   "compliance_required",
   "upstream_error",
@@ -636,6 +697,407 @@ async function addUserBalance(userId, amount, note) {
   }
 
   return upstream;
+}
+
+// ------------------------------------------------------------------ 测试额度
+//
+// 「领测试额度」比签到更严格：账号必须在注册后的 N 天内领取，且每个账号只能领一次。
+// 领取记录落在 trial_claims，唯一键是 user_id，先占位再加余额，避免重复发放。
+
+function getTrialCreditConfig() {
+  const enabled = readBoolSetting("trial_credit_enabled", config.trialCreditEnabled);
+  const amount = roundAmount(
+    Math.max(0, readNumberSetting("trial_credit_amount", config.trialCreditAmount || 0))
+  );
+  const allowedDays = Math.max(0, Math.round(readNumberSetting("trial_credit_days", config.trialCreditDays || 0)));
+
+  return {
+    enabled: Boolean(enabled),
+    amount,
+    allowedDays,
+    unit: config.checkinUnit
+  };
+}
+
+function publicTrialCreditConfig() {
+  return getTrialCreditConfig();
+}
+
+function validateTrialCreditConfig(value) {
+  const current = getTrialCreditConfig();
+  const enabled = typeof value?.enabled === "boolean" ? value.enabled : current.enabled;
+  const amount = roundAmount(Number(value?.amount ?? current.amount));
+  const allowedDays = Math.round(Number(value?.allowedDays ?? current.allowedDays));
+
+  if (!Number.isFinite(amount) || amount < 0 || (enabled && amount <= 0)) {
+    throw httpError(400, "invalid_trial_credit", "启用测试额度时，金额必须大于 0。");
+  }
+
+  if (!Number.isFinite(allowedDays) || allowedDays < 1 || allowedDays > 365) {
+    throw httpError(400, "invalid_trial_credit", "注册天数限制必须是 1 到 365 之间的整数。");
+  }
+
+  return {
+    enabled,
+    amount,
+    allowedDays,
+    unit: config.checkinUnit
+  };
+}
+
+function findTrialClaim(userId) {
+  const row = db
+    .prepare(
+      `SELECT
+        id,
+        user_id AS userId,
+        user_name AS userName,
+        user_email AS userEmail,
+        amount,
+        unit,
+        note,
+        registered_at AS registeredAt,
+        registered_days AS registeredDays,
+        created_at AS createdAt,
+        upstream_status AS upstreamStatus
+       FROM trial_claims
+       WHERE user_id = ?
+       LIMIT 1`
+    )
+    .get(String(userId));
+
+  return row || null;
+}
+
+function insertTrialClaim(entry) {
+  db.prepare(
+    `INSERT INTO trial_claims
+      (id, user_id, user_name, user_email, amount, unit, note, registered_at, registered_days, created_at, upstream_status)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).run(
+    entry.id,
+    entry.userId,
+    entry.userName || "",
+    entry.userEmail || "",
+    entry.amount,
+    entry.unit,
+    entry.note || "",
+    entry.registeredAt || "",
+    Number.isFinite(entry.registeredDays) ? entry.registeredDays : null,
+    entry.createdAt,
+    entry.upstreamStatus ?? null
+  );
+}
+
+function getRecentTrialClaims(limit = 20) {
+  return db
+    .prepare(
+      `SELECT
+        id,
+        user_id AS userId,
+        user_name AS userName,
+        user_email AS userEmail,
+        amount,
+        unit,
+        note,
+        registered_at AS registeredAt,
+        registered_days AS registeredDays,
+        created_at AS createdAt,
+        upstream_status AS upstreamStatus
+       FROM trial_claims
+       ORDER BY created_at DESC
+       LIMIT ?`
+    )
+    .all(Math.max(1, Math.min(200, Math.round(Number(limit) || 20))));
+}
+
+function getTrialClaimStats() {
+  const row = db
+    .prepare("SELECT COUNT(*) AS count, COALESCE(SUM(amount), 0) AS amount FROM trial_claims")
+    .get();
+
+  return {
+    count: Number(row?.count || 0),
+    amount: roundAmount(Number(row?.amount || 0)),
+    unit: config.checkinUnit
+  };
+}
+
+function publicTrialEntry(entry) {
+  return {
+    date: dateKey(new Date(entry.createdAt), config.checkinTimezone),
+    amount: entry.amount,
+    unit: entry.unit,
+    rewardLabel: "测试额度",
+    note: entry.note || "",
+    registeredAt: entry.registeredAt || "",
+    createdAt: entry.createdAt
+  };
+}
+
+function publicAdminTrialClaim(entry) {
+  return {
+    userId: String(entry.userId),
+    userName: entry.userName || "",
+    userEmail: entry.userEmail || "",
+    amount: entry.amount,
+    unit: entry.unit,
+    registeredAt: entry.registeredAt || "",
+    registeredDays: entry.registeredDays,
+    createdAt: entry.createdAt
+  };
+}
+
+// 读取 Sub2API 用户信息：注册时间（判断是否在新用户窗口内）与当前余额。
+async function fetchSub2apiUser(userId) {
+  if (!config.adminAuthValue) {
+    throw httpError(500, "missing_admin_api_key", "服务端未配置 SUB2API_ADMIN_API_KEY。");
+  }
+
+  if (!config.userInfoPathTemplate) {
+    throw httpError(502, "registration_time_unavailable", "服务端未配置 Sub2API 用户信息接口。");
+  }
+
+  const pathTemplate = config.userInfoPathTemplate
+    .replace("{id}", encodeURIComponent(String(userId)))
+    .replace("{userId}", encodeURIComponent(String(userId)));
+  const url = `${config.sub2apiBaseUrl}${pathTemplate}`;
+  const upstream = await fetchJson(url, {
+    method: "GET",
+    headers: {
+      Accept: "application/json",
+      [config.adminAuthHeader]: config.adminAuthValue
+    }
+  });
+
+  if (!upstream.ok) {
+    logError("sub2api.user.failed", {
+      userId: String(userId),
+      status: upstream.status,
+      body: upstream.body
+    });
+
+    if (upstream.status === 404) {
+      throw httpError(404, "user_not_found", "Sub2API 用户不存在。");
+    }
+
+    if (upstream.status === 423) {
+      throw httpError(423, "compliance_required", "站点管理员尚未完成合规确认。");
+    }
+
+    throw httpError(502, "registration_time_unavailable", "无法获取 Sub2API 用户信息。");
+  }
+
+  const node =
+    upstream.body && typeof upstream.body === "object" && upstream.body.data && typeof upstream.body.data === "object"
+      ? upstream.body.data
+      : upstream.body || {};
+  const registeredAt = firstNonEmpty(
+    valueAtPath(node, config.userCreatedAtField),
+    valueAtPath(node, "created_at"),
+    valueAtPath(node, "createdAt"),
+    valueAtPath(node, "created")
+  );
+  const balanceText = firstNonEmpty(
+    valueAtPath(node, config.userBalanceField),
+    valueAtPath(node, "balance")
+  );
+  const balance = Number(balanceText);
+
+  return {
+    registeredAt: registeredAt ? String(registeredAt) : "",
+    balance: Number.isFinite(balance) ? roundAmount(balance) : null
+  };
+}
+
+function parseRegistrationDate(value) {
+  const text = String(value ?? "").trim();
+
+  if (!text) {
+    return null;
+  }
+
+  if (/^\d+$/.test(text)) {
+    const numeric = Number(text);
+    const millis = text.length >= 13 ? numeric : numeric * 1000;
+    const fromNumber = new Date(millis);
+
+    return Number.isNaN(fromNumber.getTime()) ? null : fromNumber;
+  }
+
+  const parsed = new Date(text);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function resolveTrialCreditEligibility(trial, claim, registeredAt) {
+  const base = {
+    enabled: trial.enabled,
+    eligible: false,
+    claimed: Boolean(claim),
+    amount: trial.amount,
+    unit: trial.unit,
+    allowedDays: trial.allowedDays,
+    registeredAt: registeredAt ? registeredAt.toISOString() : "",
+    registeredDays: null,
+    claimedAt: claim?.createdAt || "",
+    reason: "",
+    message: ""
+  };
+
+  if (!trial.enabled || trial.amount <= 0 || trial.allowedDays <= 0) {
+    return {
+      ...base,
+      reason: "trial_credit_disabled",
+      message: "测试额度活动未开启。"
+    };
+  }
+
+  if (claim) {
+    return {
+      ...base,
+      reason: "already_claimed",
+      message: "该账号已经领取过测试额度。"
+    };
+  }
+
+  if (!registeredAt) {
+    return {
+      ...base,
+      reason: "registration_time_unavailable",
+      message: "无法获取账号注册时间。"
+    };
+  }
+
+  const registeredDays = Math.round((Math.max(0, Date.now() - registeredAt.getTime()) / 86_400_000) * 10) / 10;
+
+  if (registeredDays > trial.allowedDays) {
+    return {
+      ...base,
+      registeredDays,
+      reason: "registration_window_expired",
+      message: `账号注册已超过 ${trial.allowedDays} 天，无法领取测试额度。`
+    };
+  }
+
+  return {
+    ...base,
+    eligible: true,
+    registeredDays
+  };
+}
+
+function resolveBalanceAfterClaim(previousBalance, upstreamBody, amount) {
+  const node =
+    upstreamBody && typeof upstreamBody === "object" && upstreamBody.data && typeof upstreamBody.data === "object"
+      ? upstreamBody.data
+      : upstreamBody;
+  const fromUpstream = Number(valueAtPath(node, config.userBalanceField));
+
+  if (Number.isFinite(fromUpstream)) {
+    return roundAmount(fromUpstream);
+  }
+
+  if (Number.isFinite(previousBalance)) {
+    return roundAmount(previousBalance + amount);
+  }
+
+  return null;
+}
+
+async function claimTrialCredit(user) {
+  return withStoreLock(async () => {
+    const trial = getTrialCreditConfig();
+
+    if (!trial.enabled || trial.amount <= 0 || trial.allowedDays <= 0) {
+      logInfo("trial_credit.disabled", { user: logUser(user) });
+      throw httpError(403, "trial_credit_disabled", "测试额度活动未开启，请联系管理员。", {
+        eligibility: resolveTrialCreditEligibility(trial, null, null)
+      });
+    }
+
+    const existing = findTrialClaim(user.id);
+
+    if (existing) {
+      logInfo("trial_credit.duplicate", {
+        user: logUser(user),
+        amount: existing.amount,
+        unit: existing.unit,
+        originalCreatedAt: existing.createdAt
+      });
+
+      return {
+        alreadyClaimed: true,
+        entry: publicTrialEntry(existing),
+        eligibility: resolveTrialCreditEligibility(
+          trial,
+          existing,
+          parseRegistrationDate(existing.registeredAt)
+        ),
+        balance: null
+      };
+    }
+
+    const profile = await fetchSub2apiUser(user.id);
+    const registeredAt = parseRegistrationDate(profile.registeredAt);
+    const eligibility = resolveTrialCreditEligibility(trial, null, registeredAt);
+
+    if (!eligibility.eligible) {
+      logInfo("trial_credit.ineligible", {
+        user: logUser(user),
+        reason: eligibility.reason,
+        registeredDays: eligibility.registeredDays,
+        allowedDays: trial.allowedDays
+      });
+
+      if (eligibility.reason === "registration_time_unavailable") {
+        throw httpError(502, "registration_time_unavailable", "无法获取账号注册时间，请联系管理员。", {
+          eligibility
+        });
+      }
+
+      throw httpError(403, "trial_window_expired", eligibility.message, { eligibility });
+    }
+
+    const date = dateKey(new Date(), config.checkinTimezone);
+    const note = `Trial credit ${date} ${trial.amount} ${trial.unit}`;
+    const upstream = await addUserBalance(user.id, trial.amount, note);
+    const identity = userIdentityForStorage(user);
+    const entry = {
+      id: `trial:${user.id}`,
+      userId: String(user.id),
+      userName: identity.userName,
+      userEmail: identity.userEmail,
+      amount: trial.amount,
+      unit: trial.unit,
+      note,
+      registeredAt: registeredAt.toISOString(),
+      registeredDays: eligibility.registeredDays,
+      createdAt: new Date().toISOString(),
+      upstreamStatus: upstream.status
+    };
+
+    insertTrialClaim(entry);
+
+    const balance = resolveBalanceAfterClaim(profile.balance, upstream.body, trial.amount);
+
+    logInfo("trial_credit.success", {
+      user: logUser(user),
+      amount: entry.amount,
+      unit: entry.unit,
+      allowedDays: trial.allowedDays,
+      registeredAt: entry.registeredAt,
+      registeredDays: entry.registeredDays,
+      upstreamStatus: upstream.status,
+      balance
+    });
+
+    return {
+      alreadyClaimed: false,
+      entry: publicTrialEntry(entry),
+      eligibility: { ...eligibility, claimed: true },
+      balance
+    };
+  });
 }
 
 async function resolveCheckinEligibility(user, date, options = {}) {
@@ -1169,6 +1631,23 @@ async function initStorage() {
 
     CREATE INDEX IF NOT EXISTS idx_checkins_created_at ON checkins (created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_checkins_user_date ON checkins (user_id, date);
+
+    CREATE TABLE IF NOT EXISTS trial_claims (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      user_name TEXT NOT NULL DEFAULT '',
+      user_email TEXT NOT NULL DEFAULT '',
+      amount REAL NOT NULL,
+      unit TEXT NOT NULL,
+      note TEXT NOT NULL DEFAULT '',
+      registered_at TEXT NOT NULL DEFAULT '',
+      registered_days REAL,
+      created_at TEXT NOT NULL,
+      upstream_status INTEGER,
+      UNIQUE (user_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_trial_claims_created_at ON trial_claims (created_at DESC);
   `);
   ensureColumn("checkins", "user_email", "TEXT NOT NULL DEFAULT ''");
 
@@ -1275,6 +1754,18 @@ function seedSettingsIfNeeded() {
   if (!getSetting("daily_spend_required_amount")) {
     setSetting("daily_spend_required_amount", config.requiredDailySpend);
   }
+
+  if (!getSetting("trial_credit_enabled")) {
+    setSetting("trial_credit_enabled", config.trialCreditEnabled ? "1" : "0");
+  }
+
+  if (!getSetting("trial_credit_amount")) {
+    setSetting("trial_credit_amount", config.trialCreditAmount);
+  }
+
+  if (!getSetting("trial_credit_days")) {
+    setSetting("trial_credit_days", config.trialCreditDays);
+  }
 }
 
 function countRows(tableName) {
@@ -1367,7 +1858,14 @@ function readNumberSetting(key, fallback) {
   return Number.isFinite(number) ? number : fallback;
 }
 
-function saveAdminConfig({ rewardMode, rewardRange, rewardRules, notePrefix, dailySpendRequirement }) {
+function saveAdminConfig({
+  rewardMode,
+  rewardRange,
+  rewardRules,
+  notePrefix,
+  dailySpendRequirement,
+  trialCredit
+}) {
   db.exec("BEGIN");
 
   try {
@@ -1379,6 +1877,9 @@ function saveAdminConfig({ rewardMode, rewardRange, rewardRules, notePrefix, dai
     setSetting("checkin_note_prefix", notePrefix);
     setSetting("daily_spend_enabled", dailySpendRequirement.enabled ? "1" : "0");
     setSetting("daily_spend_required_amount", dailySpendRequirement.requiredAmount);
+    setSetting("trial_credit_enabled", trialCredit.enabled ? "1" : "0");
+    setSetting("trial_credit_amount", trialCredit.amount);
+    setSetting("trial_credit_days", trialCredit.allowedDays);
     setSetting("reward_rules_updated_at", new Date().toISOString());
     db.exec("COMMIT");
   } catch (error) {
@@ -1701,6 +2202,7 @@ function getUserCurrentStreak(userId, today = dateKey(new Date(), config.checkin
 
 function getAdminSystemInfo() {
   const dailySpendRequirement = publicDailySpendRequirement();
+  const trialCredit = publicTrialCreditConfig();
 
   return {
     storage: "SQLite",
@@ -1720,6 +2222,11 @@ function getAdminSystemInfo() {
     dailySpendPathTemplate: config.dailySpendPathTemplate,
     dailySpendBodyTemplate: config.dailySpendBodyTemplate,
     dailySpendAmountField: config.dailySpendAmountField,
+    trialCredit,
+    trialCreditConfigured: Boolean(config.userInfoPathTemplate),
+    trialCreditEnabled: config.trialCreditEnabled,
+    userInfoPathTemplate: config.userInfoPathTemplate,
+    userCreatedAtField: config.userCreatedAtField,
     dbFile: config.dbFile,
     timezone: config.checkinTimezone,
     unit: config.checkinUnit
@@ -2730,6 +3237,34 @@ function renderAdmin() {
               </label>
             </div>
             <p class="hint range-preview" id="dailySpendPreview"></p>
+          </section>
+
+          <section class="reward-section" id="trialCreditSection">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">Trial Credit</p>
+                <h2>测试额度</h2>
+              </div>
+              <p class="hint">QQ 机器人「/领测试额度」使用。只允许注册未超过指定天数的账号领取一次，金额从下面的配置发放。</p>
+            </div>
+            <div class="range-grid">
+              <label class="toggle-field" for="trialCreditEnabledInput">
+                <span>启用领测试额度</span>
+                <input id="trialCreditEnabledInput" type="checkbox" />
+                <small>关闭后机器人回复“测试额度活动未开启”。</small>
+              </label>
+              <label for="trialCreditAmountInput">
+                <span>每次发放金额</span>
+                <input id="trialCreditAmountInput" type="number" min="0" step="0.000001" placeholder="1" />
+                <small>单位跟随 CHECKIN_UNIT，例如 USD。</small>
+              </label>
+              <label for="trialCreditDaysInput">
+                <span>注册后多少天内可领</span>
+                <input id="trialCreditDaysInput" type="number" min="1" max="365" step="1" placeholder="3" />
+                <small>按注册时间起算的小时数折算，超过则不能领取。</small>
+              </label>
+            </div>
+            <p class="hint range-preview" id="trialCreditPreview"></p>
           </section>
 
           <label class="note-prefix-field" for="notePrefixInput">
